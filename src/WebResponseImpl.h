@@ -47,12 +47,18 @@ class AsyncAbstractResponse: public AsyncWebServerResponse {
     // we won't be able to access it as contiguous array of bytes when reading from it,
     // so by gaining performance in one place, we'll lose it in another.
     std::vector<uint8_t> _cache;
+    // What the connection couldn't take when it was out of memory, sent before anything else
+    uint8_t *_unsent = nullptr;
+    size_t _unsentOffset = 0;
+    size_t _unsentLength = 0;
+    bool _unsentIsLast = false;
     size_t _readDataFromCacheOrContent(uint8_t* data, const size_t len);
     size_t _fillBufferAndProcessTemplates(uint8_t* buf, size_t maxLen);
   protected:
     AwsTemplateProcessor _callback;
   public:
     AsyncAbstractResponse(AwsTemplateProcessor callback=nullptr);
+    virtual ~AsyncAbstractResponse() { free(_unsent); }
     void _respond(AsyncWebServerRequest *request);
     size_t _ack(AsyncWebServerRequest *request, size_t len, uint32_t time);
     bool _sourceValid() const { return false; }

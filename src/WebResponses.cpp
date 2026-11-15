@@ -179,37 +179,11 @@ AsyncBasicResponse::AsyncBasicResponse(int code, const String& contentType, cons
 }
 
 void AsyncBasicResponse::_respond(AsyncWebServerRequest *request){
-  _state = RESPONSE_HEADERS;
-  String out = _assembleHead(request->version());
-  size_t outLen = out.length();
-  size_t space = request->client()->space();
-  if(!_contentLength && space >= outLen){
-    _writtenLength += request->client()->write(out.c_str(), outLen);
-    _state = RESPONSE_WAIT_ACK;
-  } else if(_contentLength && space >= outLen + _contentLength){
-    out += _content;
-    outLen += _contentLength;
-    _writtenLength += request->client()->write(out.c_str(), outLen);
-    _state = RESPONSE_WAIT_ACK;
-  } else if(space && space < outLen){
-    String partial = out.substring(0, space);
-    _content = out.substring(space) + _content;
-    _contentLength += outLen - space;
-    _writtenLength += request->client()->write(partial.c_str(), partial.length());
-    _state = RESPONSE_CONTENT;
-  } else if(space > outLen && space < (outLen + _contentLength)){
-    size_t shift = space - outLen;
-    outLen += shift;
-    _sentLength += shift;
-    out += _content.substring(0, shift);
-    _content = _content.substring(shift);
-    _writtenLength += request->client()->write(out.c_str(), outLen);
-    _state = RESPONSE_CONTENT;
-  } else {
-    _content = out + _content;
-    _contentLength += outLen;
-    _state = RESPONSE_CONTENT;
-  }
+  // The head goes in front of the content, and _ack() sends as much as the connection takes
+  _content = _assembleHead(request->version()) + _content;
+  _contentLength = _content.length();
+  _state = RESPONSE_CONTENT;
+  _ack(request, 0, 0);
 }
 
 size_t AsyncBasicResponse::_ack(AsyncWebServerRequest *request, size_t len, uint32_t time){
@@ -218,19 +192,19 @@ size_t AsyncBasicResponse::_ack(AsyncWebServerRequest *request, size_t len, uint
   if(_state == RESPONSE_CONTENT){
     size_t available = _contentLength - _sentLength;
     size_t space = request->client()->space();
-    //we can fit in this packet
-    if(space > available){
-      _writtenLength += request->client()->write(_content.c_str(), available);
+    // add() says how much was queued, which is less, or none, when lwIP is out of memory. The rest
+    // waits for the next poll or ack. write() also says none when the data was queued but not yet sent.
+    size_t queued = request->client()->add(_content.c_str() + _sentLength, space < available ? space : available);
+    if(queued){
+      request->client()->send();
+    }
+    _sentLength += queued;
+    _writtenLength += queued;
+    if(_sentLength == _contentLength){
       _content = String();
       _state = RESPONSE_WAIT_ACK;
-      return available;
     }
-    //send some data, the rest on ack
-    String out = _content.substring(0, space);
-    _content = _content.substring(space);
-    _sentLength += space;
-    _writtenLength += request->client()->write(out.c_str(), space);
-    return space;
+    return queued;
   } else if(_state == RESPONSE_WAIT_ACK){
     if(_ackedLength >= _writtenLength){
       _state = RESPONSE_END;
@@ -269,6 +243,27 @@ size_t AsyncAbstractResponse::_ack(AsyncWebServerRequest *request, size_t len, u
     return 0;
   }
   _ackedLength += len;
+
+  // add() says how much was queued, which is less, or none, when lwIP is out of memory. write() also
+  // says none when the data was queued but not yet sent. What isn't queued waits for the next poll or ack.
+  if(_unsent){
+    size_t queued = request->client()->add((const char*)_unsent + _unsentOffset, _unsentLength);
+    if(queued){
+      request->client()->send();
+    }
+    _writtenLength += queued;
+    _unsentOffset += queued;
+    _unsentLength -= queued;
+    if(!_unsentLength){
+      free(_unsent);
+      _unsent = nullptr;
+      if(_unsentIsLast){
+        _state = RESPONSE_WAIT_ACK;
+      }
+    }
+    return queued;
+  }
+
   size_t space = request->client()->space();
 
   size_t headLen = _head.length();
@@ -277,10 +272,13 @@ size_t AsyncAbstractResponse::_ack(AsyncWebServerRequest *request, size_t len, u
       _state = RESPONSE_CONTENT;
       space -= headLen;
     } else {
-      String out = _head.substring(0, space);
-      _head = _head.substring(space);
-      _writtenLength += request->client()->write(out.c_str(), out.length());
-      return out.length();
+      size_t queued = request->client()->add(_head.c_str(), space);
+      if(queued){
+        request->client()->send();
+      }
+      _writtenLength += queued;
+      _head = _head.substring(queued);
+      return queued;
     }
   }
 
@@ -338,8 +336,13 @@ size_t AsyncAbstractResponse::_ack(AsyncWebServerRequest *request, size_t len, u
         _head = String();
     }
 
+    size_t queued = 0;
     if(outLen){
-        _writtenLength += request->client()->write((const char*)buf, outLen);
+        queued = request->client()->add((const char*)buf, outLen);
+        if(queued){
+          request->client()->send();
+        }
+        _writtenLength += queued;
     }
 
     if(_chunked){
@@ -348,12 +351,20 @@ size_t AsyncAbstractResponse::_ack(AsyncWebServerRequest *request, size_t len, u
         _sentLength += outLen - headLen;
     }
 
-    free(buf);
-
-    if((_chunked && readLen == 0) || (!_sendContentLength && outLen == 0) || (!_chunked && _sentLength == _contentLength)){
-      _state = RESPONSE_WAIT_ACK;
+    bool last = (_chunked && readLen == 0) || (!_sendContentLength && outLen == 0) || (!_chunked && _sentLength == _contentLength);
+    if(queued < outLen){
+      // It's been read from the source, so keep it
+      _unsent = buf;
+      _unsentOffset = queued;
+      _unsentLength = outLen - queued;
+      _unsentIsLast = last;
+    } else {
+      free(buf);
+      if(last){
+        _state = RESPONSE_WAIT_ACK;
+      }
     }
-    return outLen;
+    return queued;
 
   } else if(_state == RESPONSE_WAIT_ACK){
     if(!_sendContentLength || _ackedLength >= _writtenLength){
